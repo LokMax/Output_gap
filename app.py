@@ -1,130 +1,160 @@
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
+from io import BytesIO
 import plotly.graph_objects as go
-import plotly.express as px
+from plotly.subplots import make_subplots
+from statsmodels.tsa.filters.hp_filter import hpfilter
+from statsmodels.tsa.x13 import x13_arima_analysis
+import datetime as dt
+import tempfile
+import os
 
-# === НАСТРОЙКА СТРАНИЦЫ ===
-st.set_page_config(page_title="Анализ выпуска", layout="wide")
+st.set_page_config(page_title="Оценка разрыва выпуска", layout="wide")
 
-st.title("📊 Панель анализа выпуска и разрыва")
+CAPITAL_ELASTICITY = 0.3
+LABOUR_ELASTICITY = 0.7
 
-# === ЗАГРУЗКА ФАЙЛА ===
-uploaded_file = st.file_uploader("Загрузите Excel/CSV с данными", type=["xlsx", "csv"])
-if uploaded_file:
-    if uploaded_file.name.endswith(".csv"):
-        df = pd.read_csv(uploaded_file, parse_dates=["date"])
-    else:
-        df = pd.read_excel(uploaded_file, parse_dates=["date"])
+st.title("Оценка разрыва выпуска")
+
+uploaded_file = st.sidebar.file_uploader("Загрузите Excel-файл с данными", type=["xlsx"])
+
+def x13_seasonal_adjustment(series, freq='Q'):
+    """
+    Возвращает сезонно скорректированный ряд через X13 ARIMA-SEATS.
+    series: pandas.Series с индексом DatetimeIndex
+    """
+    # statsmodels требует, чтобы индекс был периодическим
+    series = pd.Series(series.values, index=pd.period_range(start=series.index[0], periods=len(series), freq=freq))
     
-    df = df.sort_values("date")
-
-    # --- Вычисление вспомогательных колонок ---
-    df["year"] = df["date"].dt.year
-    df["quarter"] = df["date"].dt.quarter
-    df["quarter_label"] = df["year"].astype(str) + " Q" + df["quarter"].astype(str)
+    # X13 работает только с положительными значениями
+    if (series <= 0).any():
+        series = series + abs(series.min()) + 1
     
-    # Пример прироста ВВП
-    annual_gdp = df.groupby("year")["output_sa"].mean()
-    if len(annual_gdp) >= 2:
-        gdp_growth = round((annual_gdp.iloc[-1] / annual_gdp.iloc[-2] - 1) * 100, 1)
-    else:
-        gdp_growth = None
+    try:
+        res = x13_arima_analysis(series)
+        return res.seasadj
+    except Exception as e:
+        st.warning(f"Не удалось выполнить X13: {e}")
+        return series  # возврат без корректировки
 
-    # === Блок с показателями ===
-    st.sidebar.subheader("📈 Ключевые показатели")
-    if gdp_growth is not None:
-        st.sidebar.metric("Прирост ВВП (без сезон.)", f"{gdp_growth}%")
-    st.sidebar.metric("Последняя дата", df["date"].max().strftime("%Y-%m-%d"))
-    st.sidebar.metric("Фактический выпуск", f"{df['output_sa'].iloc[-1]:,.0f}".replace(",", " "))
+if uploaded_file is not None:
+    # Чтение данных
+    cap_data = pd.read_excel(uploaded_file, sheet_name="Capital")
+    pop_data = pd.read_excel(uploaded_file, sheet_name="Population")
+    other_data = pd.read_excel(uploaded_file, sheet_name="Other_data")
 
-    # === Вкладки ===
-    tab1, tab2, tab3 = st.tabs(["Разрыв выпуска", "Занятость", "Капитал и инвестиции"])
+    industries = other_data[['industry_code', 'industry']].drop_duplicates().sort_values('industry_code')
+    industry = st.sidebar.selectbox("Выберите отрасль", industries['industry'])
+    code = industries.loc[industries['industry'] == industry, 'industry_code'].values[0]
 
-    # === Вкладка 1: Выпуск + Разрыв ===
+    # --- Фильтрация по отрасли ---
+    cap_data = cap_data[cap_data['industry_code'] == code]
+    other_data = other_data[other_data['industry_code'] == code]
+
+    # --- Приведение дат ---
+    for df in [cap_data, pop_data, other_data]:
+        df['date'] = pd.to_datetime(df['date'])
+
+    # --- Основные ряды ---
+    output = other_data[other_data['indicator'] == "Приведённая отгрузка"].copy()
+    investments = other_data[other_data['indicator'] == "Приведённые инвестиции в основной капитал"].copy()
+    employment = other_data[other_data['indicator'] == "Численность работников"].copy()
+    capital = cap_data[cap_data['indicator'] == "Реальные основные фонды за вычетом учётного износа"].copy()
+    depreciation = cap_data[cap_data['indicator'] == "Ставка учётного износа"]['value'].values[0] / 4
+
+    # --- Сезонная корректировка X13 ---
+    output['output_sa'] = x13_seasonal_adjustment(output['value'], freq='Q')
+    investments['investments_sa'] = x13_seasonal_adjustment(investments['value'], freq='Q')
+
+    # --- Капитал по методу инвентаризации ---
+    investment_sa = investments['investments_sa'].values
+    capital_inventory = np.zeros(len(investment_sa))
+    capital_inventory[0] = capital['value'].iloc[0]
+    for t in range(1, len(investment_sa)):
+        capital_inventory[t] = capital_inventory[t-1] * (1 - depreciation) + investment_sa[t]
+
+    # --- Потенциальная занятость ---
+    population = pop_data[pop_data['indicator'] == "Численность населения в трудоспособном возрасте, всего"]
+    population_qtr = np.repeat(population['value'].values, 4)[:len(employment)]
+    employment_ratio = employment['value'].values / population_qtr
+    cycle, trend = hpfilter(employment_ratio, lamb=1600)
+    potential_employment = trend * population_qtr * (1 - 0.046)
+
+    # --- Потенциальный выпуск ---
+    ln_output = np.log(output['value'].values)
+    ln_capital_inventory = np.log(capital_inventory)
+    ln_potential_employment = np.log(potential_employment)
+
+    ln_tfp_inventory = ln_output - CAPITAL_ELASTICITY * ln_capital_inventory - LABOUR_ELASTICITY * ln_potential_employment
+    cycle, ln_tfp_trend = hpfilter(ln_tfp_inventory, lamb=1600)
+    ln_potential_output_inventory = ln_tfp_trend + CAPITAL_ELASTICITY * ln_capital_inventory + LABOUR_ELASTICITY * ln_potential_employment
+    potential_output_inventory = np.exp(ln_potential_output_inventory)
+    output_gap_inventory = output['output_sa'].values - potential_output_inventory
+
+    df = pd.DataFrame({
+        "date": output['date'],
+        "output": output['value'],
+        "output_sa": output['output_sa'],
+        "investments": investments['value'],
+        "investments_sa": investments['investments_sa'],
+        "capital_inventory": capital_inventory,
+        "employment": employment['value'],
+        "potential_employment": potential_employment,
+        "potential_output_inv": potential_output_inventory,
+        "output_gap_inventory": output_gap_inventory
+    })
+
+    # --- Ключевые показатели ---
+    df['year'] = df['date'].dt.year
+    df_last_year = df.groupby('year').last().reset_index()
+    last_year = df_last_year['year'].max()
+    prev_year = last_year - 1
+
+    gdp_growth = round((df_last_year.loc[df_last_year['year']==last_year,'output_sa'].values[0] /
+                        df_last_year.loc[df_last_year['year']==prev_year,'output_sa'].values[0] - 1)*100, 1)
+    output_gap_abs = int(df['output_gap_inventory'].iloc[-1])
+    output_gap_pct = round(df['output_gap_inventory'].iloc[-1] / df['potential_output_inv'].iloc[-1]*100, 1)
+    capital_growth = round((df_last_year.loc[df_last_year['year']==last_year,'capital_inventory'].values[0] /
+                            df_last_year.loc[df_last_year['year']==prev_year,'capital_inventory'].values[0] - 1)*100, 1)
+    emp_growth = round((df_last_year.loc[df_last_year['year']==last_year,'employment'].values[0] /
+                        df_last_year.loc[df_last_year['year']==prev_year,'employment'].values[0] - 1)*100, 1)
+
+    st.sidebar.markdown("### Ключевые показатели")
+    st.sidebar.table(pd.DataFrame({
+        "Показатель": [
+            f"Прирост выпуска (без сезонности), {last_year} к {prev_year}",
+            "Последний разрыв выпуска",
+            "Последний разрыв выпуска (доля от потенциала)",
+            f"Прирост капитала, {last_year} к {prev_year}",
+            f"Прирост занятости, {last_year} к {prev_year}"
+        ],
+        "Значение": [
+            f"{gdp_growth} %",
+            f"{output_gap_abs:,}".replace(",", " "),
+            f"{output_gap_pct} %",
+            f"{capital_growth} %",
+            f"{emp_growth} %"
+        ]
+    }))
+
+    # --- Вкладка 1: Разрыв выпуска ---
+    tab1, tab2, tab3 = st.tabs(["Разрыв выпуска", "Занятость", "Капитал"])
+
     with tab1:
-        st.subheader("Динамика выпуска и разрыв")
-        
-        # График 1: Выпуск
-        fig1 = go.Figure()
-        fig1.add_trace(go.Scatter(x=df["date"], y=df["output"],
-                                  mode="lines+markers", name="Факт",
-                                  line=dict(color="#62C358"),
-                                  marker=dict(size=6, line=dict(width=1,color="#62C358"), color="white"),
-                                  hovertext=df["quarter_label"]))
-        
-        fig1.add_trace(go.Scatter(x=df["date"], y=df["output_sa"],
-                                  mode="lines+markers", name="Факт (без сезон.)",
-                                  line=dict(color="#085800"),
-                                  marker=dict(size=6, line=dict(width=1,color="#085800"), color="white"),
-                                  hovertext=df["quarter_label"]))
-
-        fig1.add_trace(go.Scatter(x=df["date"], y=df["potential_output_inv"],
-                                  mode="lines+markers", name="Потенциальный выпуск",
-                                  line=dict(color="#A30008"),
-                                  marker=dict(size=6, line=dict(width=1,color="#A30008"), color="white"),
-                                  hovertext=df["quarter_label"]))
-
-        # Лента ±2.5%
-        fig1.add_trace(go.Scatter(
-            x=list(df["date"])+list(df["date"][::-1]),
-            y=list(df["potential_output_inv"]*1.025)+list(df["potential_output_inv"]*0.975)[::-1],
-            fill="toself",
-            fillcolor="rgba(239,124,83,0.2)",
-            line=dict(color="transparent"),
-            showlegend=True,
-            name="±2.5%"
-        ))
-
-        fig1.update_layout(title="Динамика выпуска в ценах 2016 года",
-                           yaxis_title="Млн/Млрд рублей")
-
-        st.plotly_chart(fig1, use_container_width=True)
-
-        # График 2: Разрыв
-        colors_gap = ["#085800" if x >= 0 else "#A30008" for x in df["output_gap_inventory"]]
-        fig2 = go.Figure(go.Bar(
-            x=df["date"], y=df["output_gap_inventory"], marker_color=colors_gap,
-            hovertext=[f"{q}<br>Разрыв: {v:,.0f}".replace(",", " ") 
-                       for q,v in zip(df["quarter_label"], df["output_gap_inventory"])]
-        ))
-        fig2.update_layout(title="Разрыв выпуска", yaxis_title="Млн/Млрд рублей")
-
-        st.plotly_chart(fig2, use_container_width=True)
-
-    # === Вкладка 2: Занятость ===
-    with tab2:
-        st.subheader("Динамика занятости")
-        fig3 = go.Figure()
-        fig3.add_trace(go.Scatter(x=df["date"], y=df["employment"],
-                                  mode="lines+markers", name="Факт",
-                                  line=dict(color="#085800"),
-                                  marker=dict(size=6, line=dict(width=1,color="#085800"), color="white"),
-                                  hovertext=df["quarter_label"]))
-        fig3.add_trace(go.Scatter(x=df["date"], y=df["potential_employment"],
-                                  mode="lines+markers", name="Потенциальная",
-                                  line=dict(color="#A30008"),
-                                  marker=dict(size=6, line=dict(width=1,color="#A30008"), color="white"),
-                                  hovertext=df["quarter_label"]))
-        fig3.update_layout(title="Динамика занятости", yaxis_title="Человек")
-        st.plotly_chart(fig3, use_container_width=True)
-
-    # === Вкладка 3: Капитал и инвестиции ===
-    with tab3:
-        st.subheader("Капитал и инвестиции")
-        
-        # Капитал
-        fig4 = px.line(df, x="date", y="capital_inventory", title="Объём капитала в ценах 2016 года")
-        fig4.update_traces(mode="lines+markers", line=dict(color="#085800"),
-                           marker=dict(size=6, line=dict(width=1,color="#085800"), color="white"),
-                           hovertext=df["quarter_label"])
-        st.plotly_chart(fig4, use_container_width=True)
-
-        # Инвестиции
-        fig5 = px.line(df, x="date", y="investments", title="Инвестиции в основные фонды в ценах 2016 года")
-        fig5.update_traces(mode="lines+markers", line=dict(color="#085800"),
-                           marker=dict(size=6, line=dict(width=1,color="#085800"), color="white"),
-                           hovertext=df["quarter_label"])
-        st.plotly_chart(fig5, use_container_width=True)
-
-else:
-    st.info("⬆️ Загрузите файл с данными для отображения дашборда")
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True)
+        # Линии выпуска
+        fig.add_trace(go.Scatter(x=df['date'], y=df['output'], mode='lines+markers',
+                                 name='Факт', line=dict(color="#62C358"),
+                                 marker=dict(color='white', line=dict(width=1,color="#62C358"))), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['date'], y=df['output_sa'], mode='lines+markers',
+                                 name='Факт (без сезон.)', line=dict(color="#085800"),
+                                 marker=dict(color='white', line=dict(width=1,color="#085800"))), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['date'], y=df['potential_output_inv'], mode='lines+markers',
+                                 name='Потенциальный выпуск', line=dict(color="#A30008"),
+                                 marker=dict(color='white', line=dict(width=1,color="#A30008"))), row=1, col=1)
+        # Разрыв
+        colors_gap = np.where(df['output_gap_inventory'] >= 0, "#085800", "#A30008")
+        fig.add_trace(go.Bar(x=df['date'], y=df['output_gap_inventory'], name='Разрыв', marker=dict(color=colors_gap)), row=2, col=1)
+        fig.update_layout(height=700, title="Динамика выпуска и разрыва")
+        st.plotly_chart(fig, use_container_width=True)
