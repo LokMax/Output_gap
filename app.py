@@ -112,4 +112,52 @@ if uploaded_file:
     st.subheader("Ключевые показатели")
     st.table(pd.DataFrame({
         "Показатель": [
-            f"Прирост выпуска (без сезонности), {last
+            f"Прирост выпуска (без сезонности), {last_year} к {prev_year}",
+            "Последний разрыв выпуска",
+            "Последний разрыв выпуска (доля от потенциала)"
+        ],
+        "Значение": [
+            f"{gdp_growth} %",
+            f"{output_gap_abs:,.0f}".replace(',', ' '),
+            f"{output_gap_pct} %"
+        ]
+    }))
+
+    # Графики
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.15,
+                        subplot_titles=("Динамика выпуска в ценах 2016 года", "Разрыв выпуска"))
+
+    # 1. Выпуск
+    fig.add_trace(go.Scatter(
+        x=df['date'], y=df['output'], name="Факт",
+        mode='lines+markers', marker=dict(size=6, color="white", line=dict(width=1, color="#62C358")),
+        line=dict(color="#62C358"),
+        hovertemplate="%{x|%Y-Q%q}<br>Выпуск: %{y:,.0f}"
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=df['date'], y=df['output_sa'], name="Факт (без сезон.)",
+        mode='lines+markers', marker=dict(size=6, color="white", line=dict(width=1, color="#085800")),
+        line=dict(color="#085800"),
+        hovertemplate="%{x|%Y-Q%q}<br>Без сезонности: %{y:,.0f}"
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=df['date'], y=df['potential_output_inv'], name="Потенциальный выпуск",
+        mode='lines+markers', marker=dict(size=6, color="white", line=dict(width=1, color="#A30008")),
+        line=dict(color="#A30008"),
+        hovertemplate="%{x|%Y-Q%q}<br>Потенциальный: %{y:,.0f}"
+    ), row=1, col=1)
+
+    # 2. Разрыв
+    colors_gap = np.where(df['output_gap_inventory'] >= 0, "#085800", "#A30008")
+    fig.add_trace(go.Bar(
+        x=df['date'], y=df['output_gap_inventory'], name="Разрыв",
+        marker_color=colors_gap,
+        hovertemplate="%{x|%Y-Q%q}<br>Разрыв: %{y:,.0f}"
+    ), row=2, col=1)
+
+    fig.update_layout(height=700, showlegend=True)
+    st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info("Загрузите Excel-файл, чтобы начать расчёты.")
